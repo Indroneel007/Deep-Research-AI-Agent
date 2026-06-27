@@ -1,4 +1,4 @@
-from langgraph import StateGraph
+from langgraph.graph import StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from typing import TypedDict, Annotated
 from openai import AsyncOpenAI
