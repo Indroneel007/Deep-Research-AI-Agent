@@ -4,8 +4,7 @@ from typing import TypedDict, Annotated, Optional
 from langgraph.graph.message import add_messages
 from langgraph.graph import END
 from dotenv import load_dotenv
-import os
-from langchain_openai import ChatOpenAI
+from config.llm import llm
 from tools.think_tool import think
 from prompts import RESEARCH_BRIEF_PROMPT
 import asyncio
@@ -18,37 +17,68 @@ from langchain_core.messages import (
 
 load_dotenv()  # Load environment variables from .env file
 
-llm = ChatOpenAI(
-    model="openai/gpt-oss-120b:free",
-    api_key=os.getenv("OPENROUTER_API_KEY"),
-    base_url="https://openrouter.ai/api/v1",
-    temperature=0
-)
-
 list_of_tools = [think]
 
 # Define the state schema (e.g., messages, memory)
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 
-    # Produced by the Research Brief Agent
     research_brief: Optional[str]
 
-    # Optional: supervisor decision
-    next_agent: Optional[str]
+    needs_clarification: Optional[bool]
+    clarification_questions: Optional[list[str]]
+    clarification_answers: Optional[dict[str, str]]
 
 # Build the workflow graph
 workflow = StateGraph(AgentState)
 # Node that calls the LLM on current messages
+from langchain_core.messages import AIMessage
+
+
 async def call_llm(state: AgentState):
+
     forced_llm = llm.bind_tools(
         list_of_tools,
         tool_choice="think"
     )
 
     response = await forced_llm.ainvoke(state["messages"])
-    return {"messages": [response]}
 
+    # Default values
+    results = {
+        "messages": [response],
+        "needs_clarification": False,
+        "clarification_questions": []
+    }
+
+    # Check if the model called the tool
+    if response.tool_calls:
+        tool_call = response.tool_calls[0]
+
+        # Assuming the tool returns:
+        # {
+        #   "needs_clarification": bool,
+        #   "questions": [...]
+        # }
+
+        tool_result = await think.ainvoke(tool_call["args"])
+
+        results["needs_clarification"] = tool_result[
+            "needs_clarification"
+        ]
+
+        results["clarification_questions"] = tool_result[
+            "questions"
+        ]
+
+    return results
+
+def clarification_router(state: AgentState):
+
+    if state["needs_clarification"]:
+        return END
+
+    return "research_brief"
 async def research_brief_node(state: AgentState):
 
     messages = [
@@ -64,39 +94,67 @@ async def research_brief_node(state: AgentState):
 workflow = StateGraph(AgentState)
 
 workflow.add_node("clarify_agent", call_llm)
-workflow.add_node("tools", ToolNode(list_of_tools))
 workflow.add_node("research_brief", research_brief_node)
 
 workflow.set_entry_point("clarify_agent")
 
 workflow.add_conditional_edges(
     "clarify_agent",
-    tools_condition,
+    clarification_router,
     {
-        "tools": "tools",
-        "__end__": END
+        "research_brief": "research_brief",
+        END: END
     }
 )
 
-workflow.add_edge("tools", "clarify_agent")
-workflow.add_edge("clarify_agent","research_brief")
+workflow.add_edge("research_brief", END)
 
 graph = workflow.compile()
 
 async def main():
-    result = await graph.ainvoke(
-        {
-            "messages": [
-                HumanMessage(content="Explain me meaning of biodiversity")
-            ]
-        }
-    )
 
-    print("\n=== Clarify Agent Output ===")
-    print(result["messages"][-1].content)
+    state = {
+        "messages": [
+            HumanMessage(
+                content=input("User: ")
+            )
+        ],
+        "clarification_answers": {}
+    }
 
-    print("\n=== Research Brief ===")
-    print(result.get("research_brief", "No research brief generated"))
+    while True:
+
+        result = await graph.ainvoke(state)
+
+        if result.get("needs_clarification"):
+
+            question = result["clarification_questions"][0]
+
+            print(f"\nAssistant: {question}")
+
+            answer = input("You: ")
+
+            answers = result.get(
+                "clarification_answers", {}
+            )
+
+            answers[question] = answer
+
+            state = {
+                **result,
+                "clarification_answers": answers,
+                "messages": result["messages"] + [
+                    HumanMessage(
+                        content=f"{question}\nAnswer: {answer}"
+                    )
+                ]
+            }
+
+            continue
+
+        print("\n=== Final Research Brief ===")
+        print(result["research_brief"])
+        break
 
 
 if __name__ == "__main__":
